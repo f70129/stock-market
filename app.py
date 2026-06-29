@@ -108,17 +108,10 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 TW_TZ = pytz.timezone("Asia/Taipei")
 
-# (source, FinMind data_id, yfinance 後援代碼)
-#   index  → FinMind TaiwanStockPrice（加權指數）
-#   future → FinMind TaiwanFuturesDaily（台指期 TX，近月）
-#   stock  → FinMind TaiwanStockPrice（個股/ETF）
-TICKERS = {
-    "台灣加權指數  TAIEX": ("index",  "TAIEX", "^TWII"),
-    "台指期       TX 近月": ("future", "TX",    None),
-    "元大台灣50   0050":   ("stock",  "0050",  "0050.TW"),
-    "台積電       2330":   ("stock",  "2330",  "2330.TW"),
-}
-
+# 資料來源類型（source）：
+#   index  → FinMind TaiwanStockPrice（加權指數 TAIEX）
+#   future → FinMind TaiwanFuturesDaily（台指期 TX，自動取近月主力契約）
+#   stock  → FinMind TaiwanStockPrice（全台上市/上櫃個股，清單由 TaiwanStockInfo 取得）
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 FIB_RET = [0.0, 0.236, 0.382, 0.500, 0.618, 0.786, 1.0]
@@ -210,7 +203,11 @@ def _period_start_iso(period: str) -> str:
 @st.cache_data(ttl=180, show_spinner=False)
 def _finmind_get(dataset: str, data_id: str, start_iso: str, token: str) -> pd.DataFrame:
     """FinMind v4 通用查詢。token 可為空字串（匿名，額度較低）。"""
-    params = {"dataset": dataset, "data_id": data_id, "start_date": start_iso}
+    params = {"dataset": dataset}
+    if data_id:
+        params["data_id"] = data_id
+    if start_iso:
+        params["start_date"] = start_iso
     if token:
         params["token"] = token
     try:
@@ -318,6 +315,24 @@ def taiwan_market_open() -> bool:
     market_open  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
     market_close = now.replace(hour=13, minute=30, second=0, microsecond=0)
     return market_open <= now <= market_close
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_stock_universe(token: str) -> pd.DataFrame:
+    """從 FinMind 取得全台上市(twse)+上櫃(tpex)股票清單。"""
+    raw = _finmind_get("TaiwanStockInfo", "", "", token)
+    if raw.empty or "stock_id" not in raw.columns:
+        return pd.DataFrame(columns=["stock_id", "stock_name", "type", "industry_category"])
+    df = raw[["stock_id", "stock_name", "type", "industry_category"]].copy()
+    # 只留上市/上櫃；去除重複代碼
+    df = df[df["type"].isin(["twse", "tpex"])]
+    df = df.drop_duplicates(subset="stock_id").sort_values("stock_id").reset_index(drop=True)
+    return df
+
+
+def _yf_suffix(market_type: str) -> str:
+    """上市→.TW；上櫃→.TWO（yfinance 後援用）。"""
+    return ".TWO" if market_type == "tpex" else ".TW"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1169,10 +1184,7 @@ def sidebar() -> dict:
     st.sidebar.markdown("## 📊 台指期 費氏×均線看板")
     st.sidebar.markdown("---")
 
-    ticker_label = st.sidebar.selectbox("商品選擇", list(TICKERS.keys()), index=0)
-    source, data_id, yf_ticker = TICKERS[ticker_label]
-
-    # ── FinMind API 金鑰（直接於看板填入）──────────────────────────────
+    # ── FinMind API 金鑰（直接於看板填入；股票清單需要它）─────────────────
     st.sidebar.markdown("#### 🔑 FinMind API 金鑰")
     token = st.sidebar.text_input(
         "FinMind Token",
@@ -1187,6 +1199,51 @@ def sidebar() -> dict:
     else:
         st.sidebar.caption("⚠️ 未填金鑰：匿名額度有限，建議填入")
     st.sidebar.markdown("[→ 免費取得 FinMind Token](https://finmindtrade.com/)")
+
+    st.sidebar.markdown("---")
+
+    # ── 商品選擇（指數 / 台指期 / 全台上市櫃個股）───────────────────────────
+    category = st.sidebar.radio(
+        "商品類型", ["台灣加權指數", "台指期 TX", "上市/上櫃個股"], index=0,
+    )
+
+    if category == "台灣加權指數":
+        source, data_id, yf_ticker = "index", "TAIEX", "^TWII"
+        disp_label = "台灣加權指數"
+    elif category == "台指期 TX":
+        source, data_id, yf_ticker = "future", "TX", None
+        disp_label = "台指期 TX"
+    else:
+        universe = fetch_stock_universe(token)
+        if universe.empty:
+            st.sidebar.warning("⚠️ 股票清單載入失敗（多半是未填 Token）。可手動輸入代碼：")
+            mkt = st.sidebar.radio("市場", ["上市 (.TW)", "上櫃 (.TWO)"], index=0,
+                                   horizontal=True)
+            code = st.sidebar.text_input("股票代碼", value="2330").strip()
+            suffix = ".TWO" if "TWO" in mkt else ".TW"
+            source, data_id, yf_ticker = "stock", code, f"{code}{suffix}"
+            disp_label = code
+        else:
+            market = st.sidebar.selectbox(
+                "市場", ["全部", "上市 (TWSE)", "上櫃 (TPEx)"], index=0,
+            )
+            sub = universe
+            if market.startswith("上市"):
+                sub = universe[universe["type"] == "twse"]
+            elif market.startswith("上櫃"):
+                sub = universe[universe["type"] == "tpex"]
+
+            options = [f"{r.stock_id} {r.stock_name}" for r in sub.itertuples()]
+            default_idx = next((i for i, o in enumerate(options)
+                                if o.startswith("2330 ")), 0)
+            pick = st.sidebar.selectbox(
+                f"選擇股票（共 {len(options)} 檔，可輸入代碼/名稱搜尋）",
+                options, index=default_idx if options else 0,
+            )
+            sid = pick.split()[0]
+            row = sub[sub["stock_id"] == sid].iloc[0]
+            source, data_id, yf_ticker = "stock", sid, f"{sid}{_yf_suffix(row['type'])}"
+            disp_label = f"{sid} {row['stock_name']}"
 
     st.sidebar.markdown("---")
 
@@ -1261,7 +1318,7 @@ def sidebar() -> dict:
         "data_id":       data_id,
         "yf":            yf_ticker,
         "token":         token,
-        "ticker_label":  ticker_label.split()[0],
+        "ticker_label":  disp_label,
         "interval":      interval,
         "period":        period,
         "swing_window":  swing_window,
