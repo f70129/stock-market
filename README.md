@@ -24,6 +24,23 @@
 
 > ⚠️ 所有訊號僅供參考，不構成投資建議。市場有風險，操作請謹慎。
 
+## 資料來源（即時真實資料）
+
+改用 **FinMind 官方 API** 抓台股真實日線資料，雲端不被限流：
+
+- **台灣加權指數**：FinMind `TaiwanStockPrice`（TAIEX）
+- **台指期 TX**：FinMind `TaiwanFuturesDaily`（自動取每日成交量最大的近月契約）
+- **個股/ETF**：FinMind `TaiwanStockPrice`
+- yfinance 為**後援**（本機或未被限流時自動補上）
+
+> 提供 日線 / 週線 / 月線（週月由日線重採樣）。週月策略所需的 200MA 需足夠歷史，預設抓 2 年。
+
+### 設定 FinMind Token（在看板上填入即可）
+
+1. 到 [finmindtrade.com](https://finmindtrade.com/) 免費註冊取得 token。
+2. 開啟看板後，於**左側欄「🔑 FinMind API 金鑰」**貼上 token（不需改 code 或 secrets）。
+3. 留空也能匿名使用，但額度低、易失敗，建議填入。
+
 ## 執行
 
 ```bash
