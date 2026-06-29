@@ -30,8 +30,8 @@
 
 - **台灣加權指數**：FinMind `TaiwanStockPrice`（TAIEX）
 - **台指期 TX**：FinMind `TaiwanFuturesDaily`（自動取每日成交量最大的近月契約）
-- **個股/ETF**：FinMind `TaiwanStockPrice`
-- yfinance 為**後援**（本機或未被限流時自動補上）
+- **全台上市 (TWSE) + 上櫃 (TPEx) 個股/ETF**：商品清單由 FinMind `TaiwanStockInfo` 動態載入，左側欄可依「市場」篩選並輸入代碼/名稱搜尋；股價走 `TaiwanStockPrice`
+- yfinance 為**後援**（本機或未被限流時自動補上；上市 `.TW`、上櫃 `.TWO`）
 
 > 提供 日線 / 週線 / 月線（週月由日線重採樣）。週月策略所需的 200MA 需足夠歷史，預設抓 2 年。
 
