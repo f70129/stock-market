@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import json
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
@@ -107,12 +108,18 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 TW_TZ = pytz.timezone("Asia/Taipei")
 
+# (source, FinMind data_id, yfinance 後援代碼)
+#   index  → FinMind TaiwanStockPrice（加權指數）
+#   future → FinMind TaiwanFuturesDaily（台指期 TX，近月）
+#   stock  → FinMind TaiwanStockPrice（個股/ETF）
 TICKERS = {
-    "台灣加權指數  ^TWII":  "^TWII",
-    "元大台灣50   0050": "0050.TW",
-    "台灣中型100  0051": "0051.TW",
-    "台積電       2330": "2330.TW",
+    "台灣加權指數  TAIEX": ("index",  "TAIEX", "^TWII"),
+    "台指期       TX 近月": ("future", "TX",    None),
+    "元大台灣50   0050":   ("stock",  "0050",  "0050.TW"),
+    "台積電       2330":   ("stock",  "2330",  "2330.TW"),
 }
+
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 FIB_RET = [0.0, 0.236, 0.382, 0.500, 0.618, 0.786, 1.0]
 FIB_EXT = [1.272, 1.414, 1.618, 2.000, 2.618]
@@ -189,26 +196,119 @@ INTERVAL_LABELS = {
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+_PERIOD_DAYS = {
+    "1d": 7, "5d": 12, "1mo": 38, "3mo": 105, "6mo": 195,
+    "1y": 380, "2y": 760, "5y": 1850,
+}
+
+
+def _period_start_iso(period: str) -> str:
+    days = _PERIOD_DAYS.get(period, 760)
+    return (datetime.now(TW_TZ).date() - timedelta(days=days)).isoformat()
+
+
 @st.cache_data(ttl=180, show_spinner=False)
-def fetch_ohlcv(ticker: str, interval: str, period: str) -> pd.DataFrame:
+def _finmind_get(dataset: str, data_id: str, start_iso: str, token: str) -> pd.DataFrame:
+    """FinMind v4 通用查詢。token 可為空字串（匿名，額度較低）。"""
+    params = {"dataset": dataset, "data_id": data_id, "start_date": start_iso}
+    if token:
+        params["token"] = token
     try:
-        df = yf.download(
-            ticker,
-            interval=interval,
-            period=period,
-            auto_adjust=True,
-            progress=False,
-            actions=False,
-        )
-        if df.empty:
-            return df
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return df
-    except Exception as exc:
-        st.error(f"資料載入失敗 ({ticker}): {exc}")
+        r = requests.get(FINMIND_URL, params=params, timeout=20)
+        j = r.json()
+    except Exception:
         return pd.DataFrame()
+    if not isinstance(j, dict) or j.get("status") != 200:
+        return pd.DataFrame()
+    return pd.DataFrame(j.get("data", []))
+
+
+def _finmind_to_ohlcv(raw: pd.DataFrame, vol_col: str) -> pd.DataFrame:
+    if raw.empty or "date" not in raw.columns:
+        return pd.DataFrame()
+    df = raw.copy()
+    df["Date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    out = pd.DataFrame({
+        "Open":   pd.to_numeric(df.get("open"),  errors="coerce"),
+        "High":   pd.to_numeric(df.get("max"),   errors="coerce"),
+        "Low":    pd.to_numeric(df.get("min"),   errors="coerce"),
+        "Close":  pd.to_numeric(df.get("close"), errors="coerce"),
+        "Volume": pd.to_numeric(df.get(vol_col), errors="coerce").fillna(0),
+    })
+    # FinMind 期貨偶有 0/缺漏的開高低，用收盤補
+    for col in ("Open", "High", "Low"):
+        out[col] = out[col].mask(out[col] <= 0).fillna(out["Close"])
+    return out.dropna(subset=["Close"])
+
+
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    agg = pd.concat([
+        df["Open"].resample(rule).first(),
+        df["High"].resample(rule).max(),
+        df["Low"].resample(rule).min(),
+        df["Close"].resample(rule).last(),
+        df["Volume"].resample(rule).sum(),
+    ], axis=1)
+    agg.columns = ["Open", "High", "Low", "Close", "Volume"]
+    return agg.dropna(subset=["Close"])
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _yf_daily(ticker: str, period: str) -> pd.DataFrame:
+    """yfinance 後援（本機/未被限流時可用）。"""
+    if not ticker:
+        return pd.DataFrame()
+    try:
+        df = yf.download(ticker, interval="1d", period=period,
+                         auto_adjust=True, progress=False, actions=False)
+        if df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_ohlcv(source: str, data_id: str, yf_ticker, interval: str,
+                period: str, token: str = "") -> pd.DataFrame:
+    """以 FinMind 官方日資料為主、yfinance 為後援，回傳 OHLCV（週/月線由日線重採樣）。"""
+    start_iso = _period_start_iso(period)
+    daily = pd.DataFrame()
+
+    try:
+        if source == "future":
+            raw = _finmind_get("TaiwanFuturesDaily", data_id, start_iso, token)
+            if not raw.empty:
+                if "trading_session" in raw.columns:
+                    keep = raw["trading_session"].isin(["position", ""]) | raw["trading_session"].isna()
+                    raw = raw[keep] if keep.any() else raw
+                raw["__v"] = pd.to_numeric(raw.get("volume", 0), errors="coerce").fillna(0)
+                # 同一天多個契約月 → 取成交量最大者（近月/主力）
+                raw = (raw.sort_values("__v")
+                          .groupby("date", as_index=False).last())
+                daily = _finmind_to_ohlcv(raw, "__v")
+        elif source in ("index", "stock"):
+            raw = _finmind_get("TaiwanStockPrice", data_id, start_iso, token)
+            daily = _finmind_to_ohlcv(raw, "Trading_Volume")
+    except Exception:
+        daily = pd.DataFrame()
+
+    # FinMind 失敗 → yfinance 後援
+    if daily.empty:
+        daily = _yf_daily(yf_ticker, period)
+    if daily.empty:
+        return daily
+
+    if interval == "1wk":
+        return _resample_ohlcv(daily, "W-FRI")
+    if interval == "1mo":
+        return _resample_ohlcv(daily, "ME")
+    return daily   # 日線（及任何非週/月設定）一律回傳日線
 
 
 def taiwan_market_open() -> bool:
@@ -1070,18 +1170,36 @@ def sidebar() -> dict:
     st.sidebar.markdown("---")
 
     ticker_label = st.sidebar.selectbox("商品選擇", list(TICKERS.keys()), index=0)
-    ticker = TICKERS[ticker_label]
+    source, data_id, yf_ticker = TICKERS[ticker_label]
+
+    # ── FinMind API 金鑰（直接於看板填入）──────────────────────────────
+    st.sidebar.markdown("#### 🔑 FinMind API 金鑰")
+    token = st.sidebar.text_input(
+        "FinMind Token",
+        value=st.session_state.get("finmind_token", ""),
+        type="password",
+        placeholder="貼上你的 FinMind token",
+        help="免費註冊 finmindtrade.com 取得 token；留空可匿名使用但額度低、易失敗。",
+    )
+    st.session_state["finmind_token"] = token
+    if token:
+        st.sidebar.caption("✅ 已套用金鑰（即時真實資料）")
+    else:
+        st.sidebar.caption("⚠️ 未填金鑰：匿名額度有限，建議填入")
+    st.sidebar.markdown("[→ 免費取得 FinMind Token](https://finmindtrade.com/)")
 
     st.sidebar.markdown("---")
 
-    interval_label = st.sidebar.selectbox(
-        "時間週期", list(INTERVAL_LABELS.values()), index=5,
-    )
-    interval = [k for k, v in INTERVAL_LABELS.items() if v == interval_label][0]
+    # FinMind 為日資料來源，僅提供 日線 / 週線 / 月線（週月由日線重採樣）
+    tf_map = {"日線": "1d", "週線": "1wk", "月線": "1mo"}
+    interval_label = st.sidebar.selectbox("時間週期", list(tf_map.keys()), index=0)
+    interval = tf_map[interval_label]
 
-    valid_period_keys   = INTERVAL_PERIODS.get(interval, ["1y"])
+    valid_period_keys   = INTERVAL_PERIODS.get(interval, ["1y", "2y", "5y"])
     valid_period_labels = [PERIOD_LABELS[k] for k in valid_period_keys]
-    default_period_idx  = min(2, len(valid_period_labels) - 1)
+    # 預設給足 200MA 所需長度（日線→2年）
+    default_key = "2y" if "2y" in valid_period_keys else valid_period_keys[-1]
+    default_period_idx = valid_period_keys.index(default_key)
     period_label = st.sidebar.selectbox(
         "資料期間", valid_period_labels, index=default_period_idx,
     )
@@ -1139,7 +1257,10 @@ def sidebar() -> dict:
     st.sidebar.markdown(f"台灣時間: `{now_tw}`")
 
     return {
-        "ticker":        ticker,
+        "source":        source,
+        "data_id":       data_id,
+        "yf":            yf_ticker,
+        "token":         token,
         "ticker_label":  ticker_label.split()[0],
         "interval":      interval,
         "period":        period,
@@ -1347,10 +1468,16 @@ def main():
         st.markdown('<meta http-equiv="refresh" content="180">', unsafe_allow_html=True)
 
     with st.spinner(f"載入 {cfg['ticker_label']} 資料中…"):
-        df = fetch_ohlcv(cfg["ticker"], cfg["interval"], cfg["period"])
+        df = fetch_ohlcv(cfg["source"], cfg["data_id"], cfg["yf"],
+                         cfg["interval"], cfg["period"], cfg["token"])
 
     if df.empty:
-        st.error("無法取得資料，請確認商品代碼或稍後再試。")
+        st.error(
+            "⚠️ 無法取得資料。可能原因：\n"
+            "1. FinMind Token 未填或額度用盡 → 於左側欄填入免費 token\n"
+            "2. 該商品/期間暫無資料 → 換商品或拉長期間\n"
+            "3. yfinance 後援在雲端被限流"
+        )
         st.stop()
 
     # ── Fibonacci anchors (auto-detected from selected timeframe) ─────────────
@@ -1916,7 +2043,8 @@ def main():
         prog = st.progress(0)
         for idx, (lbl, (iv, pr)) in enumerate(mtf_intervals.items()):
             prog.progress((idx + 1) / len(mtf_intervals), text=f"載入 {lbl}…")
-            df_m = fetch_ohlcv(cfg["ticker"], iv, pr)
+            df_m = fetch_ohlcv(cfg["source"], cfg["data_id"], cfg["yf"],
+                               iv, pr, cfg["token"])
             if df_m.empty:
                 continue
             sh_m, shi_m, sl_m, sli_m = dominant_swing(df_m, cfg["swing_window"])
@@ -1948,9 +2076,10 @@ def main():
             for row in mtf_results:
                 labels_mtf.append(row["時間框架"])
                 try:
-                    df_m2 = fetch_ohlcv(cfg["ticker"],
+                    df_m2 = fetch_ohlcv(cfg["source"], cfg["data_id"], cfg["yf"],
                                         mtf_intervals[row["時間框架"]][0],
-                                        mtf_intervals[row["時間框架"]][1])
+                                        mtf_intervals[row["時間框架"]][1],
+                                        cfg["token"])
                     sh2, shi2, sl2, sli2 = dominant_swing(df_m2, cfg["swing_window"])
                     tr2  = trend_from_swings(shi2, sli2)
                     ret2 = fib_retracement(sh2, sl2)
@@ -1984,11 +2113,14 @@ def main():
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown("---")
+    src_name = {"future": "FinMind 台指期(TX)",
+                "index":  "FinMind 加權指數",
+                "stock":  "FinMind 個股"}.get(cfg["source"], "FinMind")
     st.markdown(
-        '<div style="text-align:center;color:#555;font-size:12px">'
-        '資料來源：Yahoo Finance ｜ 費氏數列×移動平均分析看板 ｜ '
-        '僅供參考，不構成投資建議'
-        '</div>',
+        f'<div style="text-align:center;color:#555;font-size:12px">'
+        f'資料來源：{src_name}（yfinance 後援）｜ 費氏數列×移動平均×策略監控看板 ｜ '
+        f'僅供參考，不構成投資建議'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
